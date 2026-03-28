@@ -781,30 +781,37 @@ function closeImportModal() {
 async function submitImport() {
   const pool = byId('import-pool').value.trim() || 'ssoBasic';
   const text = byId('import-text').value;
-  const lines = text.split('\n');
-  const defaultQuota = getDefaultQuotaForPool(pool);
+  const tokens = text
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
 
-  lines.forEach(line => {
-    const t = line.trim();
-    if (t && !flatTokens.some(ft => ft.token === t)) {
-      flatTokens.push({
-        token: t,
-        pool: pool,
-        status: 'active',
-        quota: defaultQuota,
-        consumed: 0,
-        note: '',
-        tags: [],
-        fail_count: 0,
-        use_count: 0,
-        _selected: false
-      });
+  if (tokens.length === 0) {
+    showToast(t('token.tokenEmpty'), 'error');
+    return;
+  }
+
+  try {
+    const res = await fetch('/v1/admin/tokens/append', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({ [pool]: tokens })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || t('common.saveFailed'));
     }
-  });
 
-  await syncToServer();
-  closeImportModal();
-  loadData();
+    const summary = data.summary || { added: 0, skipped: 0, invalid: 0 };
+    showToast(`新增 ${summary.added} 个，跳过 ${summary.skipped} 个，非法 ${summary.invalid} 个`, 'success');
+    closeImportModal();
+    await loadData();
+  } catch (e) {
+    showToast(t('common.saveError', { msg: e.message }), 'error');
+  }
 }
 
 // Export Logic

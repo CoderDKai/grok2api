@@ -43,6 +43,18 @@ def _sanitize_token_text(value) -> str:
     return token.encode("ascii", errors="ignore").decode("ascii")
 
 
+def _extract_token_value(item) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return item.get("token") or ""
+    return ""
+
+
+def _empty_append_counts() -> dict[str, int]:
+    return {"added": 0, "skipped": 0, "invalid": 0}
+
+
 @router.get("/tokens", dependencies=[Depends(verify_app_key)])
 async def get_tokens():
     """获取所有 Token"""
@@ -129,6 +141,59 @@ async def update_tokens(data: dict):
             mgr = await get_token_manager()
             await mgr.reload()
         return {"status": "success", "message": "Token 已更新"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/tokens/append", dependencies=[Depends(verify_app_key)])
+async def append_tokens(data: dict):
+    """追加 Token 信息，不覆盖现有 Token"""
+    try:
+        mgr = await get_token_manager()
+        summary = _empty_append_counts()
+        pools = {}
+        seen = set()
+
+        for pool_name, tokens in (data or {}).items():
+            if not isinstance(tokens, list):
+                continue
+
+            pool_counts = _empty_append_counts()
+            pools[pool_name] = pool_counts
+
+            for item in tokens:
+                token = _sanitize_token_text(_extract_token_value(item))
+                if not token:
+                    pool_counts["invalid"] += 1
+                    summary["invalid"] += 1
+                    continue
+
+                if token in seen:
+                    pool_counts["skipped"] += 1
+                    summary["skipped"] += 1
+                    continue
+
+                seen.add(token)
+
+                if mgr.get_pool_name_for_token(token):
+                    pool_counts["skipped"] += 1
+                    summary["skipped"] += 1
+                    continue
+
+                added = await mgr.add(token, pool_name)
+                if added:
+                    pool_counts["added"] += 1
+                    summary["added"] += 1
+                else:
+                    pool_counts["skipped"] += 1
+                    summary["skipped"] += 1
+
+        return {
+            "status": "success",
+            "message": "Token 追加完成",
+            "summary": summary,
+            "pools": pools,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
