@@ -2,6 +2,7 @@
 Reverse interface: app chat conversations.
 """
 
+import inspect
 import orjson
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from app.services.reverse.utils.headers import build_headers
 from app.services.reverse.utils.retry import extract_status_for_retry, retry_on_status
 
 CHAT_API = "https://grok.com/rest/app-chat/conversations/new"
+_LAST_PROXY_LOG_STATE: tuple[str, str] | None = None
 
 
 def _normalize_chat_proxy(proxy_url: str) -> str:
@@ -31,8 +33,62 @@ def _normalize_chat_proxy(proxy_url: str) -> str:
     return proxy_url
 
 
+def _log_proxy_state_once(base_proxy: str, normalized_proxy: str = "", scheme: str = ""):
+    """仅在代理状态变化时记录一次代理配置日志。"""
+    global _LAST_PROXY_LOG_STATE
+
+    state = ("enabled", normalized_proxy) if base_proxy else ("direct", "")
+    if state == _LAST_PROXY_LOG_STATE:
+        return
+
+    _LAST_PROXY_LOG_STATE = state
+    if base_proxy:
+        logger.info(
+            f"AppChatReverse proxy enabled: scheme={scheme}, target={normalized_proxy}"
+        )
+    else:
+        logger.info("AppChatReverse proxy is empty, requests will use direct network")
+
+
 class AppChatReverse:
     """/rest/app-chat/conversations/new reverse interface."""
+
+    @staticmethod
+    async def _read_error_body(response: Any) -> str:
+        """Best-effort read for non-200 upstream responses."""
+        readers = (
+            "text",
+            "atext",
+            "read",
+            "aread",
+        )
+        for attr_name in readers:
+            attr = getattr(response, attr_name, None)
+            if attr is None:
+                continue
+            try:
+                value = attr() if callable(attr) else attr
+                if inspect.isawaitable(value):
+                    value = await value
+                if value is None:
+                    continue
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="ignore")
+                value = str(value)
+                if value:
+                    return value
+            except Exception:
+                continue
+
+        content = getattr(response, "content", None)
+        if content:
+            try:
+                if isinstance(content, bytes):
+                    return content.decode("utf-8", errors="ignore")
+                return str(content)
+            except Exception:
+                pass
+        return ""
 
     @staticmethod
     def _resolve_custom_personality() -> Optional[str]:
@@ -147,6 +203,21 @@ class AppChatReverse:
             Any: The response from the request.
         """
         try:
+            # Get proxies
+            base_proxy = get_config("proxy.base_proxy_url")
+            proxy = None
+            proxies = None
+            if base_proxy:
+                normalized_proxy = _normalize_chat_proxy(base_proxy)
+                scheme = urlparse(normalized_proxy).scheme.lower()
+                if scheme.startswith("socks"):
+                    # curl_cffi 对 SOCKS 代理优先使用 proxy 参数，避免被按 HTTP CONNECT 处理
+                    proxy = normalized_proxy
+                else:
+                    proxies = {"http": normalized_proxy, "https": normalized_proxy}
+                _log_proxy_state_once(base_proxy, normalized_proxy, scheme)
+            else:
+                _log_proxy_state_once("")
             # Build headers
             headers = build_headers(
                 cookie_token=token,
@@ -200,13 +271,9 @@ class AppChatReverse:
                         proxy = normalized_proxy
                     else:
                         proxies = {"http": normalized_proxy, "https": normalized_proxy}
-                    logger.info(
-                        f"AppChatReverse proxy enabled: scheme={scheme}, target={normalized_proxy}"
-                    )
+                    _log_proxy_state_once(base_proxy, normalized_proxy, scheme)
                 else:
-                    logger.warning(
-                        "AppChatReverse proxy is empty, request will use direct network"
-                    )
+                    _log_proxy_state_once("")
                 response = await session.post(
                     CHAT_API,
                     headers=headers,
@@ -219,20 +286,14 @@ class AppChatReverse:
                 )
 
                 if response.status_code != 200:
+                    content = await AppChatReverse._read_error_body(response)
+                    content_type = str(response.headers.get("content-type", ""))
 
-                    # Get response content
-                    content = ""
-                    try:
-                        content = await response.text()
-                    except Exception:
-                        pass
-
-                    logger.debug(
-                        "AppChatReverse: Chat failed response body: %s",
-                        content,
-                    )
                     logger.error(
-                        f"AppChatReverse: Chat failed, {response.status_code}",
+                        "AppChatReverse: Chat failed, %s, content_type=%s, body=%s",
+                        response.status_code,
+                        content_type,
+                        content[:500],
                         extra={"error_type": "UpstreamException"},
                     )
                     raise UpstreamException(
