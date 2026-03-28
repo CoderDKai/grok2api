@@ -517,6 +517,7 @@ class StreamProcessor(proc_base.BaseProcessor):
         self.think_closed_once: bool = False
         self.image_think_active: bool = False
         self.role_sent: bool = False
+        self._substantive_emitted: bool = False
         self.filter_tags = get_config("app.filter_tags")
         self.tool_usage_enabled = (
             "xai:tool_usage_card" in (self.filter_tags or [])
@@ -698,11 +699,12 @@ class StreamProcessor(proc_base.BaseProcessor):
         delta = {}
         if role:
             delta["role"] = role
-            delta["content"] = ""
-        elif tool_calls is not None:
+        if tool_calls is not None:
             delta["tool_calls"] = tool_calls
-        elif content:
+        if content:
             delta["content"] = content
+        elif role and tool_calls is None:
+            delta["content"] = ""
 
         chunk = {
             "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -715,6 +717,21 @@ class StreamProcessor(proc_base.BaseProcessor):
             ],
         }
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+    def _emit_sse(
+        self,
+        content: str = "",
+        *,
+        tool_calls: list = None,
+        finish: str = None,
+    ) -> str:
+        role = None
+        if (content or tool_calls is not None) and not self.role_sent:
+            role = "assistant"
+            self.role_sent = True
+        if content or tool_calls is not None:
+            self._substantive_emitted = True
+        return self._sse(content=content, role=role, finish=finish, tool_calls=tool_calls)
 
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """Process stream response.
@@ -751,27 +768,23 @@ class StreamProcessor(proc_base.BaseProcessor):
                 if rid := resp.get("rolloutId"):
                     self.rollout_id = str(rid)
 
-                if not self.role_sent:
-                    yield self._sse(role="assistant")
-                    self.role_sent = True
-
                 if img := resp.get("streamingImageGenerationResponse"):
                     if not self.show_think:
                         continue
                     self.image_think_active = True
                     if not self.think_opened:
-                        yield self._sse("<think>\n")
+                        yield self._emit_sse("<think>\n")
                         self.think_opened = True
                     idx = img.get("imageIndex", 0) + 1
                     progress = img.get("progress", 0)
-                    yield self._sse(
+                    yield self._emit_sse(
                         f"正在生成第{idx}张图片中，当前进度{progress}%\n"
                     )
                     continue
 
                 if mr := resp.get("modelResponse"):
                     if self.image_think_active and self.think_opened:
-                        yield self._sse("\n</think>\n")
+                        yield self._emit_sse("\n</think>\n")
                         self.think_opened = False
                         self.think_closed_once = True
                     self.image_think_active = False
@@ -782,7 +795,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                         rendered = await dl_service.render_image(
                             url, self.token, img_id
                         )
-                        yield self._sse(f"{rendered}\n")
+                        yield self._emit_sse(f"{rendered}\n")
 
                     if (
                         (meta := mr.get("metadata", {}))
@@ -806,9 +819,9 @@ class StreamProcessor(proc_base.BaseProcessor):
                             if original:
                                 title_safe = title.replace("\n", " ").strip()
                                 if title_safe:
-                                    yield self._sse(f"![{title_safe}]({original})\n")
+                                    yield self._emit_sse(f"![{title_safe}]({original})\n")
                                 else:
-                                    yield self._sse(f"![image]({original})\n")
+                                    yield self._emit_sse(f"![image]({original})\n")
                     continue
 
                 if (token := resp.get("token")) is not None:
@@ -827,42 +840,50 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if not self.show_think:
                             continue
                         if not self.think_opened:
-                            yield self._sse("<think>\n")
+                            yield self._emit_sse("<think>\n")
                             self.think_opened = True
                     else:
                         if self.think_opened:
-                            yield self._sse("\n</think>\n")
+                            yield self._emit_sse("\n</think>\n")
                             self.think_opened = False
                             self.think_closed_once = True
 
                     if in_think:
-                        yield self._sse(filtered)
+                        yield self._emit_sse(filtered)
                         continue
 
                     if self._tool_stream_enabled:
                         for kind, payload in self._handle_tool_stream(filtered):
                             if kind == "text":
-                                yield self._sse(payload)
+                                yield self._emit_sse(payload)
                             elif kind == "tool":
-                                yield self._sse(tool_calls=[payload])
+                                yield self._emit_sse(tool_calls=[payload])
                         continue
 
-                    yield self._sse(filtered)
+                    yield self._emit_sse(filtered)
 
             if self.think_opened:
-                yield self._sse("</think>\n")
+                yield self._emit_sse("</think>\n")
                 self.think_closed_once = True
 
             if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
                     if kind == "text":
-                        yield self._sse(payload)
+                        yield self._emit_sse(payload)
                     elif kind == "tool":
-                        yield self._sse(tool_calls=[payload])
+                        yield self._emit_sse(tool_calls=[payload])
                 finish_reason = "tool_calls" if self._tool_calls_seen else "stop"
-                yield self._sse(finish=finish_reason)
             else:
-                yield self._sse(finish="stop")
+                finish_reason = "stop"
+
+            if not self._substantive_emitted:
+                raise UpstreamException(
+                    message="Upstream returned an empty stream response",
+                    status_code=502,
+                    details={"type": "empty_stream_response"},
+                )
+
+            yield self._sse(finish=finish_reason)
 
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:

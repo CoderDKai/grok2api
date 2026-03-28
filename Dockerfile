@@ -27,7 +27,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --frozen --no-dev --no-install-project \
+RUN uv sync --frozen --no-dev \
+    && test -x /opt/venv/bin/granian \
     && find /opt/venv -type d -name "__pycache__" -prune -exec rm -rf {} + \
     && find /opt/venv -type f -name "*.pyc" -delete \
     && find /opt/venv -type d -name "tests" -prune -exec rm -rf {} + \

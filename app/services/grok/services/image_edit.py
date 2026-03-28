@@ -333,6 +333,18 @@ class ImageStreamProcessor(BaseProcessor):
         """Build SSE response."""
         return f"event: {event}\ndata: {orjson.dumps(data).decode()}\n\n"
 
+    def _empty_stream_error(self) -> str:
+        return self._sse(
+            "error",
+            {
+                "error": {
+                    "message": "Image stream completed without any image output",
+                    "type": "server_error",
+                    "code": "empty_image_stream",
+                }
+            },
+        )
+
     async def process(
         self, response: AsyncIterable[bytes]
     ) -> AsyncGenerator[str, None]:
@@ -486,20 +498,10 @@ class ImageStreamProcessor(BaseProcessor):
                     )
 
             if self.chat_format:
-                if not self._id_generated:
-                    self._response_id = make_response_id()
-                    self._id_generated = True
                 if not emitted_chat_chunk:
-                    yield self._sse(
-                        "chat.completion.chunk",
-                        make_chat_chunk(
-                            self._response_id,
-                            self.model,
-                            "",
-                            index=0,
-                            is_final=True,
-                        ),
-                    )
+                    yield self._empty_stream_error()
+                    yield "data: [DONE]\n\n"
+                    return
                 yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             logger.debug("Image stream cancelled by client")

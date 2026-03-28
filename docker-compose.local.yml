@@ -1,0 +1,27 @@
+services:
+  grok2api-local:
+    container_name: grok2api-local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grok2api:local
+    ports:
+      - "${HOST_PORT_LOCAL:-18082}:8000"
+    environment:
+      TZ: Asia/Shanghai
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: "8000"
+      SERVER_WORKERS: ${SERVER_WORKERS:-1}
+      SERVER_STORAGE_TYPE: ${SERVER_STORAGE_TYPE:-local}
+      SERVER_STORAGE_URL: ${SERVER_STORAGE_URL:-}
+      # 本地构建调试默认复用宿主机已暴露的 FlareSolverr
+      FLARESOLVERR_URL: ${FLARESOLVERR_URL:-http://host.docker.internal:8191}
+      CF_REFRESH_INTERVAL: "600"
+      CF_TIMEOUT: "60"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
